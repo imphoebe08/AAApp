@@ -1,13 +1,542 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>my-split-bill-app</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, collection, doc, addDoc, updateDoc, 
+  deleteDoc, onSnapshot, query, getDoc 
+} from 'firebase/firestore';
+import { 
+  getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken 
+} from 'firebase/auth';
+import { 
+  Plus, UserPlus, Trash2, ArrowLeft, CheckCircle2, 
+  Circle, Edit2, RotateCcw, ChevronRight, DollarSign, Calendar, FileText
+} from 'lucide-react';
+
+// --- Firebase 配置與初始化 ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+// 將 appId 預設值更新為你的 GitHub 專案名稱 AAApp，確保本地開發路徑一致
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'AAApp';
+
+// --- 常數定義 ---
+const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+const PAGES = {
+  HOME: 'home',
+  USER_EDIT: 'user_edit',
+  TRASH: 'trash',
+  PROJECT_DETAIL: 'project_detail'
+};
+
+const App = () => {
+  // --- 狀態管理 ---
+  const [user, setUser] = useState(null);
+  const [currentPage, setCurrentPage] = useState(PAGES.HOME);
+  const [currentProjectId, setCurrentProjectId] = useState(null);
+  
+  // 資料狀態
+  const [globalUsers, setGlobalUsers] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+  
+  // UI 互動狀態
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalType, setModalType] = useState(''); // 'project', 'expense', 'user'
+  const [editingItem, setEditingItem] = useState(null);
+
+  // --- 初始化 Auth ---
+  useEffect(() => {
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // --- 資料訂閱 (符合 Rule 1 & 2) ---
+  useEffect(() => {
+    if (!user) return;
+
+    // 訂閱使用者列表
+    const usersRef = collection(db, 'artifacts', appId, 'public', 'data', 'users');
+    const unsubUsers = onSnapshot(usersRef, (snapshot) => {
+      setGlobalUsers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (err) => console.error(err));
+
+    // 訂閱專案列表
+    const projectsRef = collection(db, 'artifacts', appId, 'public', 'data', 'projects');
+    const unsubProjects = onSnapshot(projectsRef, (snapshot) => {
+      setProjects(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (err) => console.error(err));
+
+    // 訂閱所有記帳內容 (前端過濾以符合 Rule 2)
+    const expensesRef = collection(db, 'artifacts', appId, 'public', 'data', 'expenses');
+    const unsubExpenses = onSnapshot(expensesRef, (snapshot) => {
+      setExpenses(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (err) => console.error(err));
+
+    return () => { unsubUsers(); unsubProjects(); unsubExpenses(); };
+  }, [user]);
+
+  // --- 業務邏輯計算 ---
+  
+  // 1. 垃圾桶過濾 (三天內刪除的項目)
+  const trashItems = useMemo(() => {
+    const now = Date.now();
+    const allDeleted = [
+      ...projects.filter(p => p.deletedAt).map(p => ({ ...p, type: 'project' })),
+      ...expenses.filter(e => e.deletedAt).map(e => ({ ...e, type: 'expense' })),
+      ...globalUsers.filter(u => u.deletedAt).map(u => ({ ...u, type: 'user' }))
+    ];
+    return allDeleted.filter(item => (now - item.deletedAt) < THREE_DAYS_MS);
+  }, [projects, expenses, globalUsers]);
+
+  // 2. 債務計算核心邏輯
+  const calculateDebts = (projectId) => {
+    const projectExpenses = expenses.filter(e => e.projectId === projectId && !e.deletedAt && !e.settled);
+    const balanceMap = {}; // { userId: amount }
+    
+    projectExpenses.forEach(exp => {
+      const amount = parseFloat(exp.amount) || 0;
+      const payerId = exp.payerId;
+      const debtorIds = exp.debtorIds || [];
+      
+      if (!debtorIds.length) return;
+      
+      const splitAmount = amount / debtorIds.length;
+      
+      // 付款人增加應收額
+      balanceMap[payerId] = (balanceMap[payerId] || 0) + amount;
+      
+      // 欠款人增加應付額
+      debtorIds.forEach(id => {
+        balanceMap[id] = (balanceMap[id] || 0) - splitAmount;
+      });
+    });
+
+    // 轉換為 "誰欠誰多少錢"
+    const creditors = [];
+    const debtors = [];
+    Object.keys(balanceMap).forEach(uid => {
+      if (balanceMap[uid] > 0.01) creditors.push({ uid, amount: balanceMap[uid] });
+      else if (balanceMap[uid] < -0.01) debtors.push({ uid, amount: Math.abs(balanceMap[uid]) });
+    });
+
+    const detailedDebts = [];
+    let cIdx = 0, dIdx = 0;
+    while (cIdx < creditors.length && dIdx < debtors.length) {
+      const payAmount = Math.min(creditors[cIdx].amount, debtors[dIdx].amount);
+      detailedDebts.push({
+        from: debtors[dIdx].uid,
+        to: creditors[cIdx].uid,
+        amount: payAmount.toFixed(0)
+      });
+      creditors[cIdx].amount -= payAmount;
+      debtors[dIdx].amount -= payAmount;
+      if (creditors[cIdx].amount < 0.01) cIdx++;
+      if (debtors[dIdx].amount < 0.01) dIdx++;
+    }
+    return detailedDebts;
+  };
+
+  // --- 資料操作動作 ---
+  
+  const handleSoftDelete = async (type, id) => {
+    const collectionName = type === 'project' ? 'projects' : type === 'expense' ? 'expenses' : 'users';
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', collectionName, id);
+    await updateDoc(docRef, { deletedAt: Date.now() });
+  };
+
+  const handleRestore = async (type, id) => {
+    const collectionName = type === 'project' ? 'projects' : type === 'expense' ? 'expenses' : 'users';
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', collectionName, id);
+    await updateDoc(docRef, { deletedAt: null });
+  };
+
+  const handlePermanentDelete = async (type, id) => {
+    const collectionName = type === 'project' ? 'projects' : type === 'expense' ? 'expenses' : 'users';
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', collectionName, id);
+    await deleteDoc(docRef);
+  };
+
+  // --- UI 元件: 莫蘭蒂風格按鈕 ---
+  const Button = ({ children, onClick, variant = 'primary', className = '' }) => {
+    const base = "px-4 py-2 rounded-xl transition-all active:scale-95 flex items-center justify-center gap-2 font-medium shadow-sm";
+    const variants = {
+      primary: "bg-[#94A7AE] text-white hover:bg-[#83969D]",
+      secondary: "bg-[#E5E1DA] text-[#6B7280] hover:bg-[#D7D2C8]",
+      danger: "bg-[#C0A0A0] text-white hover:bg-[#B08F8F]",
+      outline: "border-2 border-[#94A7AE] text-[#94A7AE] hover:bg-[#F0F4F5]"
+    };
+    return (
+      <button onClick={onClick} className={`${base} ${variants[variant]} ${className}`}>
+        {children}
+      </button>
+    );
+  };
+
+  // --- 子頁面渲染 ---
+
+  // 1. 主選單
+  const renderHome = () => (
+    <div className="space-y-6 animate-in fade-in duration-500">
+      <header className="flex justify-between items-center">
+        <h1 className="text-3xl font-serif text-[#5B6D72]">日常分帳</h1>
+        <div className="flex gap-2">
+          <Button variant="secondary" onClick={() => setCurrentPage(PAGES.TRASH)}>
+            <Trash2 size={18} />
+          </Button>
+          <Button onClick={() => { setModalType('project'); setEditingItem(null); setIsModalOpen(true); }}>
+            <Plus size={18} /> 新專案
+          </Button>
+        </div>
+      </header>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {projects.filter(p => !p.deletedAt).map(project => (
+          <div key={project.id} className="bg-white p-5 rounded-3xl shadow-sm border border-[#F0EBE3] group hover:border-[#94A7AE] transition-colors cursor-pointer"
+               onClick={() => { setCurrentProjectId(project.id); setCurrentPage(PAGES.PROJECT_DETAIL); }}>
+            <div className="flex justify-between items-start mb-4">
+              <h3 className="text-xl font-medium text-[#6B7280]">{project.name}</h3>
+              <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button onClick={(e) => { e.stopPropagation(); setEditingItem(project); setModalType('project'); setIsModalOpen(true); }} className="text-[#94A7AE] hover:text-[#5B6D72]">
+                  <Edit2 size={16} />
+                </button>
+                <button onClick={(e) => { e.stopPropagation(); handleSoftDelete('project', project.id); }} className="text-[#C0A0A0] hover:text-[#A08080]">
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            </div>
+            <div className="text-sm text-[#A3A3A3] flex items-center gap-2">
+              <UserPlus size={14} /> {project.userIds?.length || 0} 位成員
+            </div>
+          </div>
+        ))}
+      </div>
+      
+      <div className="mt-8">
+        <Button variant="outline" className="w-full py-4 border-dashed" onClick={() => setCurrentPage(PAGES.USER_EDIT)}>
+          <UserPlus size={20} /> 管理常用成員
+        </Button>
+      </div>
+    </div>
+  );
+
+  // 2. 使用者編輯
+  const renderUserEdit = () => (
+    <div className="space-y-6">
+      <header className="flex items-center gap-4">
+        <button onClick={() => setCurrentPage(PAGES.HOME)} className="p-2 hover:bg-[#E5E1DA] rounded-full transition-colors">
+          <ArrowLeft size={24} className="text-[#5B6D72]" />
+        </button>
+        <h1 className="text-2xl font-serif text-[#5B6D72]">常用成員</h1>
+      </header>
+
+      <div className="bg-white rounded-3xl p-6 shadow-sm border border-[#F0EBE3] space-y-4">
+        <div className="flex gap-2">
+          <input 
+            type="text" id="newUserName" placeholder="輸入成員姓名..."
+            className="flex-1 bg-[#F9F8F6] border-none rounded-xl px-4 py-2 focus:ring-2 focus:ring-[#94A7AE] outline-none"
+          />
+          <Button onClick={async () => {
+            const name = document.getElementById('newUserName').value;
+            if (!name) return;
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'users'), { name, createdAt: Date.now(), deletedAt: null });
+            document.getElementById('newUserName').value = '';
+          }}>新增</Button>
+        </div>
+
+        <div className="divide-y divide-[#F0EBE3]">
+          {globalUsers.filter(u => !u.deletedAt).map(user => (
+            <div key={user.id} className="py-3 flex justify-between items-center group">
+              <span className="text-[#6B7280]">{user.name}</span>
+              <div className="flex gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button onClick={() => handleSoftDelete('user', user.id)} className="text-[#C0A0A0]">
+                  <Trash2 size={18} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  // 3. 專案詳情 (包含記帳與結算)
+  const renderProjectDetail = () => {
+    const project = projects.find(p => p.id === currentProjectId);
+    if (!project) return null;
+    const projectDebts = calculateDebts(currentProjectId);
+    const projectExpenses = expenses.filter(e => e.projectId === currentProjectId && !e.deletedAt);
+
+    return (
+      <div className="space-y-6">
+        <header className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <button onClick={() => setCurrentPage(PAGES.HOME)} className="p-2 hover:bg-[#E5E1DA] rounded-full">
+              <ArrowLeft size={24} className="text-[#5B6D72]" />
+            </button>
+            <h1 className="text-2xl font-serif text-[#5B6D72]">{project.name}</h1>
+          </div>
+          <Button onClick={() => { setModalType('expense'); setEditingItem(null); setIsModalOpen(true); }}>
+            <Plus size={18} /> 記一筆
+          </Button>
+        </header>
+
+        {/* 欠款摘要區 */}
+        <div className="bg-[#F0F4F5] rounded-3xl p-6 border border-[#DCE4E6]">
+          <h3 className="text-sm font-semibold text-[#83969D] uppercase tracking-wider mb-4">結算分析</h3>
+          {projectDebts.length > 0 ? (
+            <div className="space-y-3">
+              {projectDebts.map((debt, idx) => (
+                <div key={idx} className="flex items-center justify-between text-[#5B6D72]">
+                  <span className="font-medium">{globalUsers.find(u => u.id === debt.from)?.name}</span>
+                  <div className="flex-1 border-t-2 border-dashed border-[#BDC9CD] mx-4 relative">
+                    <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-[#F0F4F5] px-2 text-xs font-bold text-[#94A7AE]">
+                      ${debt.amount}
+                    </span>
+                  </div>
+                  <span className="font-medium">{globalUsers.find(u => u.id === debt.to)?.name}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-[#A3A3A3] text-center italic">目前帳務已清或無支出</p>
+          )}
+        </div>
+
+        {/* 記帳清單 */}
+        <div className="space-y-4">
+          {projectExpenses.sort((a,b) => b.date.localeCompare(a.date)).map(exp => (
+            <div key={exp.id} className={`p-4 rounded-2xl border transition-all ${exp.settled ? 'bg-[#FAFAFA] border-[#EEE] opacity-60 grayscale' : 'bg-white border-[#F0EBE3] shadow-sm'}`}>
+              <div className="flex items-center gap-4">
+                <button 
+                  onClick={async () => {
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'expenses', exp.id);
+                    await updateDoc(docRef, { settled: !exp.settled });
+                  }}
+                  className="transition-colors"
+                >
+                  {exp.settled ? <CheckCircle2 className="text-[#94A7AE]" /> : <Circle className="text-[#D1D5DB]" />}
+                </button>
+                <div className="flex-1" onClick={() => { if(!exp.settled) { setEditingItem(exp); setModalType('expense'); setIsModalOpen(true); } }}>
+                  <div className="flex justify-between items-center">
+                    <h4 className="font-medium text-[#6B7280]">{exp.name}</h4>
+                    <span className="text-lg font-serif text-[#5B6D72]">${exp.amount}</span>
+                  </div>
+                  <div className="flex gap-4 text-xs text-[#A3A3A3] mt-1">
+                    <span className="flex items-center gap-1"><Calendar size={12}/> {exp.date}</span>
+                    <span className="flex items-center gap-1"><DollarSign size={12}/> {globalUsers.find(u => u.id === exp.payerId)?.name} 付</span>
+                  </div>
+                  {exp.notes && <p className="text-xs text-[#BCBCBC] mt-1 flex items-center gap-1"><FileText size={12}/> {exp.notes}</p>}
+                </div>
+                {!exp.settled && (
+                  <button onClick={() => handleSoftDelete('expense', exp.id)} className="text-[#C0A0A0] p-1">
+                    <Trash2 size={16} />
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  // 4. 垃圾桶頁面
+  const renderTrash = () => (
+    <div className="space-y-6">
+      <header className="flex items-center gap-4">
+        <button onClick={() => setCurrentPage(PAGES.HOME)} className="p-2 hover:bg-[#E5E1DA] rounded-full">
+          <ArrowLeft size={24} className="text-[#5B6D72]" />
+        </button>
+        <h1 className="text-2xl font-serif text-[#5B6D72]">資源回收</h1>
+      </header>
+      <p className="text-sm text-[#A3A3A3] bg-[#FEF2F2] p-3 rounded-xl border border-[#FEE2E2]">
+        提示：刪除的項目將在此保留 3 天。
+      </p>
+
+      <div className="space-y-3">
+        {trashItems.length > 0 ? trashItems.map(item => (
+          <div key={item.id} className="bg-white p-4 rounded-2xl shadow-sm border border-[#F0EBE3] flex justify-between items-center">
+            <div>
+              <span className="text-[10px] uppercase font-bold text-[#94A7AE] block mb-1">{item.type === 'project' ? '專案' : '款項'}</span>
+              <span className="text-[#6B7280]">{item.name || '未命名'}</span>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => handleRestore(item.type, item.id)} className="p-2 bg-[#F0F4F5] text-[#5B6D72] rounded-full hover:bg-[#E5E1DA]">
+                <RotateCcw size={18} />
+              </button>
+              <button onClick={() => handlePermanentDelete(item.type, item.id)} className="p-2 bg-[#FEF2F2] text-[#C0A0A0] rounded-full hover:bg-[#FEE2E2]">
+                <Trash2 size={18} />
+              </button>
+            </div>
+          </div>
+        )) : (
+          <div className="text-center py-12 text-[#D1D5DB]">垃圾桶空空如也</div>
+        )}
+      </div>
+    </div>
+  );
+
+  // --- Modal 元件 (整合新增/編輯) ---
+  const Modal = () => {
+    if (!isModalOpen) return null;
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      const formData = new FormData(e.target);
+      const data = Object.fromEntries(formData.entries());
+
+      try {
+        if (modalType === 'project') {
+          const selectedUsers = globalUsers.filter(u => !u.deletedAt && formData.get(`user_${u.id}`)).map(u => u.id);
+          const payload = { name: data.name, userIds: selectedUsers, deletedAt: null };
+          
+          if (editingItem) {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', editingItem.id), payload);
+          } else {
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'projects'), payload);
+          }
+        } else if (modalType === 'expense') {
+          const debtorIds = globalUsers.filter(u => !u.deletedAt && formData.get(`debtor_${u.id}`)).map(u => u.id);
+          const payload = {
+            projectId: currentProjectId,
+            name: data.name,
+            amount: data.amount,
+            date: data.date,
+            payerId: data.payerId,
+            debtorIds,
+            notes: data.notes,
+            settled: editingItem?.settled || false,
+            deletedAt: null
+          };
+          
+          if (editingItem) {
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'expenses', editingItem.id), payload);
+          } else {
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'expenses'), payload);
+          }
+        }
+        setIsModalOpen(false);
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    return (
+      <div className="fixed inset-0 bg-[#5B6D72]/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="bg-[#FAF9F6] w-full max-w-md rounded-[2.5rem] shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
+          <form onSubmit={handleSubmit} className="p-8 space-y-5">
+            <h2 className="text-2xl font-serif text-[#5B6D72] mb-2">
+              {editingItem ? '編輯' : '新增'}{modalType === 'project' ? '專案' : '帳務'}
+            </h2>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="text-xs font-bold text-[#A3A3A3] mb-1 block">名稱</label>
+                <input required name="name" defaultValue={editingItem?.name} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-[#94A7AE] transition-all" />
+              </div>
+
+              {modalType === 'project' && (
+                <div>
+                  <label className="text-xs font-bold text-[#A3A3A3] mb-2 block">選取成員</label>
+                  <div className="max-h-40 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
+                    {globalUsers.filter(u => !u.deletedAt).map(user => (
+                      <label key={user.id} className="flex items-center gap-3 p-2 hover:bg-white rounded-lg cursor-pointer transition-colors border border-transparent hover:border-[#E5E1DA]">
+                        <input type="checkbox" name={`user_${user.id}`} defaultChecked={editingItem?.userIds?.includes(user.id)} className="rounded text-[#94A7AE] focus:ring-[#94A7AE]" />
+                        <span className="text-sm text-[#6B7280]">{user.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {modalType === 'expense' && (
+                <>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs font-bold text-[#A3A3A3] mb-1 block">金額</label>
+                      <input required type="number" name="amount" defaultValue={editingItem?.amount} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-[#94A7AE]" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-bold text-[#A3A3A3] mb-1 block">日期</label>
+                      <input required type="date" name="date" defaultValue={editingItem?.date || new Date().toISOString().split('T')[0]} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-[#94A7AE]" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-[#A3A3A3] mb-1 block">主要付款人</label>
+                    <select name="payerId" defaultValue={editingItem?.payerId} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-[#94A7AE]">
+                      {globalUsers.filter(u => !u.deletedAt && projects.find(p => p.id === currentProjectId)?.userIds?.includes(u.id)).map(user => (
+                        <option key={user.id} value={user.id}>{user.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-[#A3A3A3] mb-2 block">分攤成員 (預設全選)</label>
+                    <div className="max-h-32 overflow-y-auto space-y-2">
+                      {globalUsers.filter(u => !u.deletedAt && projects.find(p => p.id === currentProjectId)?.userIds?.includes(u.id)).map(user => (
+                        <label key={user.id} className="flex items-center gap-3 text-sm text-[#6B7280]">
+                          <input type="checkbox" name={`debtor_${user.id}`} defaultChecked={editingItem ? editingItem.debtorIds?.includes(user.id) : true} />
+                          {user.name}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-[#A3A3A3] mb-1 block">備註</label>
+                    <input name="notes" defaultValue={editingItem?.notes} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none" />
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="flex gap-3 pt-4">
+              <Button type="button" variant="secondary" className="flex-1" onClick={() => setIsModalOpen(false)}>取消</Button>
+              <Button type="submit" className="flex-1">儲存</Button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  };
+
+  // --- 主渲染邏輯 ---
+  return (
+    <div className="min-h-screen bg-[#F7F4EF] text-[#333] font-sans selection:bg-[#94A7AE]/20">
+      <div className="max-w-2xl mx-auto px-6 py-10">
+        {!user ? (
+          <div className="flex items-center justify-center h-64">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#94A7AE]"></div>
+          </div>
+        ) : (
+          <>
+            {currentPage === PAGES.HOME && renderHome()}
+            {currentPage === PAGES.USER_EDIT && renderUserEdit()}
+            {currentPage === PAGES.TRASH && renderTrash()}
+            {currentPage === PAGES.PROJECT_DETAIL && renderProjectDetail()}
+          </>
+        )}
+      </div>
+      <Modal />
+      
+      {/* 全域 CSS 微調 */}
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@500;700&family=Noto+Sans+TC:wght@400;500&display=swap');
+        body { font-family: 'Noto Sans TC', sans-serif; }
+        .font-serif { font-family: 'Noto Serif TC', serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #E5E1DA; border-radius: 10px; }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
