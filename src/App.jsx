@@ -127,7 +127,7 @@ const App = () => {
 
   // --- 分帳演算邏輯 ---
   const projectDebts = useMemo(() => {
-    if (!currentProjectId) return [];
+    if (!currentProjectId) return { detailed: [], balances: [] };
     const activeExpenses = expenses.filter(e => e.projectId === currentProjectId && !e.deletedAt && !e.settled);
     const balanceMap = {}; 
     activeExpenses.forEach(exp => {
@@ -138,6 +138,13 @@ const App = () => {
       balanceMap[exp.payerId] = (balanceMap[exp.payerId] || 0) + amount;
       debtors.forEach(id => { balanceMap[id] = (balanceMap[id] || 0) - splitAmt; });
     });
+
+    // 整理每個人的淨額 (供 UI 顯示使用，讓使用者了解抵銷過程)
+    const balances = Object.keys(balanceMap)
+      .map(uid => ({ uid, net: balanceMap[uid] }))
+      .filter(b => Math.abs(b.net) > 0.1)
+      .sort((a, b) => b.net - a.net);
+
     const creditors = [], debtorsArr = [];
     Object.keys(balanceMap).forEach(uid => {
       if (balanceMap[uid] > 0.1) creditors.push({ uid, amt: balanceMap[uid] });
@@ -163,7 +170,7 @@ const App = () => {
       if (creditors[ci].amt < 0.1) ci++;
       if (debtorsArr[di].amt < 0.1) di++;
     }
-    return detailed;
+    return { detailed, balances };
   }, [expenses, currentProjectId]);
 
   // --- CRUD 操作 ---
@@ -258,7 +265,20 @@ const App = () => {
         </header>
         <div className="bg-[#F0F4F5] rounded-3xl p-6 border border-[#DCE4E6] space-y-4 shadow-inner">
           <h3 className="text-[10px] font-bold text-[#83969D] tracking-widest uppercase">債務分析</h3>
-          {projectDebts.length > 0 ? projectDebts.map((d, i) => (
+          
+          {/* 顯示個人淨額，破解「消失的帳務」錯覺 */}
+          {projectDebts.balances?.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-4 border-b border-[#DCE4E6] pb-4">
+              {projectDebts.balances.map(b => (
+                <div key={b.uid} className={`px-3 py-1.5 rounded-xl text-xs font-medium flex gap-1 items-center shadow-sm ${b.net > 0 ? 'bg-white text-[#94A7AE] border border-[#94A7AE]/30' : 'bg-white text-[#C0A0A0] border border-[#C0A0A0]/30'}`}>
+                  <span>{globalUsers.find(u => u.id === b.uid)?.name}</span>
+                  <span className="font-bold">{b.net > 0 ? '應收' : '應付'} ${Math.round(Math.abs(b.net))}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {projectDebts.detailed?.length > 0 ? projectDebts.detailed.map((d, i) => (
             <div key={i} className="flex items-center justify-between text-sm text-[#5B6D72]">
               <span className="bg-white px-3 py-1 rounded-lg shadow-sm font-medium">{globalUsers.find(u => u.id === d.from)?.name}</span>
               <div className="flex-1 border-b-2 border-dashed border-[#BDC9CD] mx-4 relative">
