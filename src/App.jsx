@@ -270,9 +270,9 @@ const App = () => {
           {projectDebts.balances?.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-4 border-b border-[#DCE4E6] pb-4">
               {projectDebts.balances.map(b => (
-                <div key={b.uid} className={`px-3 py-1.5 rounded-xl text-xs font-medium flex gap-1 items-center shadow-sm ${b.net > 0 ? 'bg-white text-[#94A7AE] border border-[#94A7AE]/30' : 'bg-white text-[#C0A0A0] border border-[#C0A0A0]/30'}`}>
+                <div key={b.uid} className={`px-3 py-1.5 rounded-xl text-xs font-medium flex gap-1 items-center shadow-sm ${Math.abs(b.net) < 0.5 ? 'bg-white text-[#A3A3A3] border border-[#DCE4E6]' : b.net > 0 ? 'bg-white text-[#94A7AE] border border-[#94A7AE]/30' : 'bg-white text-[#C0A0A0] border border-[#C0A0A0]/30'}`}>
                   <span>{globalUsers.find(u => u.id === b.uid)?.name}</span>
-                  <span className="font-bold">{b.net > 0 ? '應收' : '應付'} ${Math.round(Math.abs(b.net))}</span>
+                  <span className="font-bold">{Math.abs(b.net) < 0.5 ? '打平 $0' : b.net > 0 ? `應收 $${Math.round(Math.abs(b.net))}` : `應付 $${Math.round(Math.abs(b.net))}`}</span>
                 </div>
               ))}
             </div>
