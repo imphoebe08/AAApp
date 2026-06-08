@@ -130,46 +130,66 @@ const App = () => {
     if (!currentProjectId) return { detailed: [], balances: [] };
     const activeExpenses = expenses.filter(e => e.projectId === currentProjectId && !e.deletedAt && !e.settled);
     const balanceMap = {}; 
+    const pairwise = {}; // 記錄兩兩之間的「原始債務」
+
     activeExpenses.forEach(exp => {
       const amount = parseFloat(exp.amount) || 0;
       const debtors = exp.debtorIds || [];
       if (!debtors.length) return;
+      
+      // 1. 每人的分攤金額
       const splitAmt = amount / debtors.length;
+      
+      // 2. 付款人 (Payer) 先加上墊款總額 (這是他應收的部分)
       balanceMap[exp.payerId] = (balanceMap[exp.payerId] || 0) + amount;
-      debtors.forEach(id => { balanceMap[id] = (balanceMap[id] || 0) - splitAmt; });
+      
+      // 3. 分攤名單 (Debtors) 每個人扣除分攤金額
+      debtors.forEach(id => { 
+        balanceMap[id] = (balanceMap[id] || 0) - splitAmt; 
+
+        // 建立兩兩互欠矩陣 (若分攤人不是付款人自己，則記錄「分攤人 欠 付款人」)
+        if (id !== exp.payerId) {
+          if (!pairwise[id]) pairwise[id] = {};
+          pairwise[id][exp.payerId] = (pairwise[id][exp.payerId] || 0) + splitAmt;
+        }
+      });
     });
 
-    // 整理每個人的淨額 (供 UI 顯示使用，讓使用者了解抵銷過程)
+    // 4. 整理每個人的最終淨額 (不過濾 $0，讓打平的人也能明確顯示)
     const balances = Object.keys(balanceMap)
       .map(uid => ({ uid, net: balanceMap[uid] }))
-      .filter(b => Math.abs(b.net) > 0.1)
       .sort((a, b) => b.net - a.net);
 
-    const creditors = [], debtorsArr = [];
-    Object.keys(balanceMap).forEach(uid => {
-      if (balanceMap[uid] > 0.1) creditors.push({ uid, amt: balanceMap[uid] });
-      else if (balanceMap[uid] < -0.1) debtorsArr.push({ uid, amt: Math.abs(balanceMap[uid]) });
+    const detailed = [];
+    const processed = new Set();
+    
+    // 5. 進行「兩兩對帳」(Pairwise Netting) 
+    // 取代大鍋炒演算法，保留「誰幫誰代墊」的真實關係，並確保共同付款人之間的帳務絕對會優先互抵
+    Object.keys(pairwise).forEach(debtor => {
+      Object.keys(pairwise[debtor]).forEach(creditor => {
+        const pair1 = `${debtor}-${creditor}`;
+        const pair2 = `${creditor}-${debtor}`;
+        if (processed.has(pair1)) return;
+        processed.add(pair1);
+        processed.add(pair2);
+
+        const oweCreditor = pairwise[debtor][creditor] || 0;
+        const oweDebtor = pairwise[creditor] ? (pairwise[creditor][debtor] || 0) : 0;
+        
+        // 計算兩人間的淨額
+        const netDebt = oweCreditor - oweDebtor;
+        const roundedAmt = Math.round(Math.abs(netDebt));
+
+        if (roundedAmt > 0) {
+          if (netDebt > 0) detailed.push({ from: debtor, to: creditor, amount: roundedAmt.toString() });
+          else detailed.push({ from: creditor, to: debtor, amount: roundedAmt.toString() });
+        }
+      });
     });
 
-    // 排序：金額大的優先配對 (貪婪演算法)，能最大化抵銷債務並大幅減少轉帳筆數
-    creditors.sort((a, b) => b.amt - a.amt);
-    debtorsArr.sort((a, b) => b.amt - a.amt);
+    // 依金額大到小排序，讓畫面好看
+    detailed.sort((a, b) => parseInt(b.amount) - parseInt(a.amount));
 
-    const detailed = [];
-    let ci = 0, di = 0;
-    while (ci < creditors.length && di < debtorsArr.length) {
-      const pay = Math.min(creditors[ci].amt, debtorsArr[di].amt);
-      const roundedPay = Math.round(pay);
-      
-      // 過濾掉因為浮點數誤差而產生的 $0 無效帳務
-      if (roundedPay > 0) {
-        detailed.push({ from: debtorsArr[di].uid, to: creditors[ci].uid, amount: roundedPay.toString() });
-      }
-      
-      creditors[ci].amt -= pay; debtorsArr[di].amt -= pay;
-      if (creditors[ci].amt < 0.1) ci++;
-      if (debtorsArr[di].amt < 0.1) di++;
-    }
     return { detailed, balances };
   }, [expenses, currentProjectId]);
 
