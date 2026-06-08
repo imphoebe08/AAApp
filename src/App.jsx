@@ -143,11 +143,22 @@ const App = () => {
       if (balanceMap[uid] > 0.1) creditors.push({ uid, amt: balanceMap[uid] });
       else if (balanceMap[uid] < -0.1) debtorsArr.push({ uid, amt: Math.abs(balanceMap[uid]) });
     });
+
+    // 排序：金額大的優先配對 (貪婪演算法)，能最大化抵銷債務並大幅減少轉帳筆數
+    creditors.sort((a, b) => b.amt - a.amt);
+    debtorsArr.sort((a, b) => b.amt - a.amt);
+
     const detailed = [];
     let ci = 0, di = 0;
     while (ci < creditors.length && di < debtorsArr.length) {
       const pay = Math.min(creditors[ci].amt, debtorsArr[di].amt);
-      detailed.push({ from: debtorsArr[di].uid, to: creditors[ci].uid, amount: pay.toFixed(0) });
+      const roundedPay = Math.round(pay);
+      
+      // 過濾掉因為浮點數誤差而產生的 $0 無效帳務
+      if (roundedPay > 0) {
+        detailed.push({ from: debtorsArr[di].uid, to: creditors[ci].uid, amount: roundedPay.toString() });
+      }
+      
       creditors[ci].amt -= pay; debtorsArr[di].amt -= pay;
       if (creditors[ci].amt < 0.1) ci++;
       if (debtorsArr[di].amt < 0.1) di++;
