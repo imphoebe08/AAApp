@@ -130,6 +130,8 @@ const App = () => {
     if (!currentProjectId) return { detailed: [], balances: [] };
     const activeExpenses = expenses.filter(e => e.projectId === currentProjectId && !e.deletedAt && !e.settled);
     const balanceMap = {}; 
+    const paidMap = {};  // 紀錄每個人總共墊付了多少錢
+    const shareMap = {}; // 紀錄每個人實際上應該分攤(花費)多少錢
 
     activeExpenses.forEach(exp => {
       const amount = parseFloat(exp.amount) || 0;
@@ -141,16 +143,18 @@ const App = () => {
       
       // 2. 付款人 (Payer) 先加上墊款總額 (這是他應收的部分)
       balanceMap[exp.payerId] = (balanceMap[exp.payerId] || 0) + amount;
+      paidMap[exp.payerId] = (paidMap[exp.payerId] || 0) + amount;
       
       // 3. 分攤名單 (Debtors) 每個人扣除分攤金額
       debtors.forEach(id => { 
         balanceMap[id] = (balanceMap[id] || 0) - splitAmt; 
+        shareMap[id] = (shareMap[id] || 0) + splitAmt;
       });
     });
 
     // 4. 整理每個人的最終淨額 (不過濾 $0，讓打平的人也能明確顯示)
     const balances = Object.keys(balanceMap)
-      .map(uid => ({ uid, net: balanceMap[uid] }))
+      .map(uid => ({ uid, net: balanceMap[uid], paid: paidMap[uid] || 0, share: shareMap[uid] || 0 }))
       .sort((a, b) => b.net - a.net);
 
     // 5. 進行「全局抵銷」(Global Netting)
@@ -278,24 +282,31 @@ const App = () => {
         <div className="bg-[#F0F4F5] rounded-3xl p-6 border border-[#DCE4E6] space-y-4 shadow-inner">
           <h3 className="text-[10px] font-bold text-[#83969D] tracking-widest uppercase">債務分析</h3>
           
-          {/* 顯示個人淨額，破解「消失的帳務」錯覺 */}
+          {/* 顯示個人淨額與實際支出明細 */}
           {projectDebts.balances?.length > 0 && (
-            <div className="flex flex-wrap gap-2 mb-4 border-b border-[#DCE4E6] pb-4">
+            <div className="flex flex-col gap-2 mb-4 border-b border-[#DCE4E6] pb-4">
               {projectDebts.balances.map(b => (
-                <div key={b.uid} className={`px-3 py-1.5 rounded-xl text-xs font-medium flex gap-1 items-center shadow-sm ${Math.abs(b.net) < 0.5 ? 'bg-white text-[#A3A3A3] border border-[#DCE4E6]' : b.net > 0 ? 'bg-white text-[#94A7AE] border border-[#94A7AE]/30' : 'bg-white text-[#C0A0A0] border border-[#C0A0A0]/30'}`}>
-                  <span>{globalUsers.find(u => u.id === b.uid)?.name}</span>
-                  <span className="font-bold">{Math.abs(b.net) < 0.5 ? '打平 $0' : b.net > 0 ? `應收 $${Math.round(Math.abs(b.net))}` : `應付 $${Math.round(Math.abs(b.net))}`}</span>
+                <div key={b.uid} className={`px-4 py-2.5 rounded-xl text-sm flex justify-between items-center shadow-sm ${Math.abs(b.net) < 0.5 ? 'bg-white text-[#A3A3A3] border border-[#DCE4E6]' : b.net > 0 ? 'bg-white text-[#94A7AE] border border-[#94A7AE]/30' : 'bg-white text-[#C0A0A0] border border-[#C0A0A0]/30'}`}>
+                  <div>
+                    <span className="font-bold block">{globalUsers.find(u => u.id === b.uid)?.name}</span>
+                    <span className="text-[10px] opacity-70">
+                      實際分攤 ${Math.round(b.share)} / 已墊付 ${Math.round(b.paid)}
+                    </span>
+                  </div>
+                  <span className="font-bold text-base">
+                    {Math.abs(b.net) < 0.5 ? '打平 $0' : b.net > 0 ? `應收 $${Math.round(Math.abs(b.net))}` : `應付 $${Math.round(Math.abs(b.net))}`}
+                  </span>
                 </div>
               ))}
             </div>
           )}
 
           {projectDebts.detailed?.length > 0 ? projectDebts.detailed.map((d, i) => (
-            <div key={i} className="flex items-center justify-between text-sm text-[#5B6D72]">
+            <div key={i} className="flex items-center justify-center gap-3 py-1 text-sm text-[#5B6D72]">
               <span className="bg-white px-3 py-1 rounded-lg shadow-sm font-medium">{globalUsers.find(u => u.id === d.from)?.name}</span>
-              <div className="flex-1 border-b-2 border-dashed border-[#BDC9CD] mx-4 relative">
-                <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-[#F0F4F5] px-2 text-xs font-bold text-[#94A7AE]">${d.amount}</span>
-              </div>
+              <span className="text-[#94A7AE] font-mono font-bold text-xs bg-[#F0F4F5] px-2 py-1 rounded-lg border border-[#DCE4E6]">
+                --${d.amount}-&gt;
+              </span>
               <span className="bg-white px-3 py-1 rounded-lg shadow-sm font-medium">{globalUsers.find(u => u.id === d.to)?.name}</span>
             </div>
           )) : <p className="text-center text-[#A3A3A3] italic py-2 text-sm">目前帳務已清清囉！</p>}
