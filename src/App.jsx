@@ -52,6 +52,7 @@ if (isValidConfig) {
 }
 
 const APP_ID = 'AAApp'; 
+const EXCHANGE_RATE_API_URL = import.meta.env.VITE_EXCHANGE_RATE_API_URL || '/api/exchange-rates';
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
 const PAGES = { HOME: 'home', SETTINGS: 'settings', PROJECT_DETAIL: 'project_detail', TRASH: 'trash' };
 const DEFAULT_CURRENCIES = [
@@ -379,14 +380,19 @@ const App = () => {
     const [currencyCode, setCurrencyCode] = useState(editingItem?.currencyCode || currencies[0]?.code || 'USD');
     const [exchangeRate, setExchangeRate] = useState(editingItem?.exchangeRate || '');
     const [rateStatus, setRateStatus] = useState('');
+    const [rateInfo, setRateInfo] = useState(null);
     const fetchRate = async () => {
       setRateStatus('loading');
+      setRateInfo(null);
       try {
-        const response = await fetch(`https://api.frankfurter.app/latest?from=${currencyCode}&to=TWD`);
+        const response = await fetch(EXCHANGE_RATE_API_URL);
         if (!response.ok) throw new Error('rate request failed');
         const result = await response.json();
-        if (!result.rates?.TWD) throw new Error('rate unavailable');
-        setExchangeRate(result.rates.TWD); setRateStatus('success');
+        const quote = result.rates?.[currencyCode];
+        if (!quote?.rate) throw new Error('rate unavailable');
+        setExchangeRate(quote.rate);
+        setRateInfo({ ...quote, rateDate: result.rateDate, source: result.source });
+        setRateStatus('success');
       } catch { setRateStatus('error'); }
     };
     return (
@@ -452,13 +458,13 @@ const App = () => {
                     </label>
                     {isForeign && <div className="p-4 bg-amber-50 border-t border-amber-100 space-y-3">
                       <div className="grid grid-cols-2 gap-2">
-                        <select name="currencyCode" value={currencyCode} onChange={e=>{setCurrencyCode(e.target.value);setRateStatus('')}} className="bg-white border border-amber-200 rounded-xl px-3 py-2">
+                        <select name="currencyCode" value={currencyCode} onChange={e=>{setCurrencyCode(e.target.value);setRateStatus('');setRateInfo(null)}} className="bg-white border border-amber-200 rounded-xl px-3 py-2">
                           {currencies.map(c => <option key={c.id} value={c.code}>{c.code} · {c.name}</option>)}
                         </select>
                         <input required name="exchangeRate" type="number" min="0" step="any" value={exchangeRate} onChange={e=>setExchangeRate(e.target.value)} placeholder="1 外幣 = ? TWD" className="bg-white border border-amber-200 rounded-xl px-3 py-2"/>
                       </div>
                       <button type="button" onClick={fetchRate} disabled={rateStatus==='loading'} className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium flex justify-center items-center gap-2"><RefreshCw size={15} className={rateStatus==='loading'?'animate-spin':''}/>{rateStatus==='loading'?'查詢中…':'取得今日匯率'}</button>
-                      <p className={`text-xs ${rateStatus==='error'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success'?'已取得今日參考匯率，可再手動調整。':rateStatus==='error'?'此幣別暫無線上匯率，請手動輸入。':'匯率定義：1 單位外幣可兌換多少新台幣。'}</p>
+                      <p className={`text-xs ${rateStatus==='error'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success' ? `${rateInfo?.source} ${rateInfo?.rateDate} ${rateInfo?.type}價，可再手動調整。` : rateStatus==='error'?'臺灣銀行未提供此幣別的即期匯率，或官方服務暫時無法連線，請手動輸入。':'資料來源：臺灣銀行前一營業日即期賣出收盤價，不使用現金匯率。'}</p>
                     </div>}
                   </div>
                   <select name="payerId" defaultValue={editingItem?.payerId} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3">
