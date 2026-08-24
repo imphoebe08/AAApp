@@ -8,8 +8,8 @@ import {
   getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken 
 } from 'firebase/auth';
 import { 
-  Plus, UserPlus, Trash2, ArrowLeft, CheckCircle2, 
-  Circle, Edit2, RotateCcw, DollarSign, Calendar, FileText, ChevronRight, AlertCircle, RefreshCw
+  Plus, Trash2, ArrowLeft, CheckCircle2,
+  Circle, Edit2, RotateCcw, ChevronRight, AlertCircle, RefreshCw, Settings, Users, Coins, X
 } from 'lucide-react';
 
 /**
@@ -53,7 +53,45 @@ if (isValidConfig) {
 
 const APP_ID = 'AAApp'; 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
-const PAGES = { HOME: 'home', USER_EDIT: 'user_edit', PROJECT_DETAIL: 'project_detail', TRASH: 'trash' };
+const PAGES = { HOME: 'home', SETTINGS: 'settings', PROJECT_DETAIL: 'project_detail', TRASH: 'trash' };
+const DEFAULT_CURRENCIES = [
+  { id: 'USD', code: 'USD', name: '美元', symbol: '$', builtIn: true },
+  { id: 'JPY', code: 'JPY', name: '日圓', symbol: '¥', builtIn: true },
+  { id: 'EUR', code: 'EUR', name: '歐元', symbol: '€', builtIn: true },
+  { id: 'KRW', code: 'KRW', name: '韓元', symbol: '₩', builtIn: true },
+  { id: 'CNY', code: 'CNY', name: '人民幣', symbol: '¥', builtIn: true },
+  { id: 'HKD', code: 'HKD', name: '港幣', symbol: 'HK$', builtIn: true }
+];
+
+const calculateDebts = (expenses, projectId) => {
+  const active = expenses.filter(e => e.projectId === projectId && !e.deletedAt && !e.settled);
+  const balanceMap = {}, paidMap = {}, shareMap = {};
+  active.forEach(exp => {
+    const amount = Number(exp.amount) || 0;
+    const debtors = exp.debtorIds || [];
+    if (!debtors.length) return;
+    const split = amount / debtors.length;
+    balanceMap[exp.payerId] = (balanceMap[exp.payerId] || 0) + amount;
+    paidMap[exp.payerId] = (paidMap[exp.payerId] || 0) + amount;
+    debtors.forEach(id => {
+      balanceMap[id] = (balanceMap[id] || 0) - split;
+      shareMap[id] = (shareMap[id] || 0) + split;
+    });
+  });
+  const balances = Object.keys(balanceMap).map(uid => ({ uid, net: balanceMap[uid], paid: paidMap[uid] || 0, share: shareMap[uid] || 0 })).sort((a,b) => b.net-a.net);
+  const creditors = balances.filter(b => b.net > .5).map(b => ({ uid:b.uid, amt:b.net }));
+  const debtors = balances.filter(b => b.net < -.5).map(b => ({ uid:b.uid, amt:-b.net }));
+  const detailed = [];
+  let ci=0, di=0;
+  while (ci < creditors.length && di < debtors.length) {
+    const pay = Math.min(creditors[ci].amt, debtors[di].amt);
+    if (Math.round(pay) > 0) detailed.push({ from:debtors[di].uid, to:creditors[ci].uid, amount:String(Math.round(pay)) });
+    creditors[ci].amt -= pay; debtors[di].amt -= pay;
+    if (creditors[ci].amt < .5) ci++;
+    if (debtors[di].amt < .5) di++;
+  }
+  return { balances, detailed };
+};
 
 // --- 錯誤提示 UI ---
 const ErrorUI = () => (
@@ -84,6 +122,7 @@ const App = () => {
   const [globalUsers, setGlobalUsers] = useState([]);
   const [projects, setProjects] = useState([]);
   const [expenses, setExpenses] = useState([]);
+  const [customCurrencies, setCustomCurrencies] = useState([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalType, setModalType] = useState('');
   const [editingItem, setEditingItem] = useState(null);
@@ -122,72 +161,16 @@ const App = () => {
       (s) => setExpenses(s.docs.map(d => ({id: d.id, ...d.data()}))),
       (e) => console.error("Expenses sync error:", e));
 
-    return () => { unsubUsers(); unsubProjects(); unsubExpenses(); };
+    const unsubCurrencies = onSnapshot(collection(db, 'artifacts', APP_ID, 'public', 'data', 'currencies'),
+      (s) => setCustomCurrencies(s.docs.map(d => ({id: d.id, ...d.data()}))),
+      (e) => console.error("Currencies sync error:", e));
+
+    return () => { unsubUsers(); unsubProjects(); unsubExpenses(); unsubCurrencies(); };
   }, [user]);
 
   // --- 分帳演算邏輯 ---
-  const projectDebts = useMemo(() => {
-    if (!currentProjectId) return { detailed: [], balances: [] };
-    const activeExpenses = expenses.filter(e => e.projectId === currentProjectId && !e.deletedAt && !e.settled);
-    const balanceMap = {}; 
-    const paidMap = {};  // 紀錄每個人總共墊付了多少錢
-    const shareMap = {}; // 紀錄每個人實際上應該分攤(花費)多少錢
-
-    activeExpenses.forEach(exp => {
-      const amount = parseFloat(exp.amount) || 0;
-      const debtors = exp.debtorIds || [];
-      if (!debtors.length) return;
-      
-      // 1. 每人的分攤金額
-      const splitAmt = amount / debtors.length;
-      
-      // 2. 付款人 (Payer) 先加上墊款總額 (這是他應收的部分)
-      balanceMap[exp.payerId] = (balanceMap[exp.payerId] || 0) + amount;
-      paidMap[exp.payerId] = (paidMap[exp.payerId] || 0) + amount;
-      
-      // 3. 分攤名單 (Debtors) 每個人扣除分攤金額
-      debtors.forEach(id => { 
-        balanceMap[id] = (balanceMap[id] || 0) - splitAmt; 
-        shareMap[id] = (shareMap[id] || 0) + splitAmt;
-      });
-    });
-
-    // 4. 整理每個人的最終淨額 (不過濾 $0，讓打平的人也能明確顯示)
-    const balances = Object.keys(balanceMap)
-      .map(uid => ({ uid, net: balanceMap[uid], paid: paidMap[uid] || 0, share: shareMap[uid] || 0 }))
-      .sort((a, b) => b.net - a.net);
-
-    // 5. 進行「全局抵銷」(Global Netting)
-    // 將所有債務單純化，直接把應付(欠錢)的人與應收(收錢)的人配對，大幅減少轉帳筆數
-    const creditors = [];
-    const debtorsArr = [];
-    Object.keys(balanceMap).forEach(uid => {
-      const net = balanceMap[uid];
-      if (net > 0.5) creditors.push({ uid, amt: net });
-      else if (net < -0.5) debtorsArr.push({ uid, amt: Math.abs(net) });
-    });
-
-    // 排序：讓大額的債務優先互相抵銷
-    creditors.sort((a, b) => b.amt - a.amt);
-    debtorsArr.sort((a, b) => b.amt - a.amt);
-
-    const detailed = [];
-    let ci = 0, di = 0;
-    while (ci < creditors.length && di < debtorsArr.length) {
-      const pay = Math.min(creditors[ci].amt, debtorsArr[di].amt);
-      const roundedPay = Math.round(pay);
-      
-      if (roundedPay > 0) {
-        detailed.push({ from: debtorsArr[di].uid, to: creditors[ci].uid, amount: roundedPay.toString() });
-      }
-      
-      creditors[ci].amt -= pay; debtorsArr[di].amt -= pay;
-      if (creditors[ci].amt < 0.5) ci++;
-      if (debtorsArr[di].amt < 0.5) di++;
-    }
-
-    return { detailed, balances };
-  }, [expenses, currentProjectId]);
+  const projectDebts = useMemo(() => calculateDebts(expenses, currentProjectId), [expenses, currentProjectId]);
+  const currencies = useMemo(() => [...DEFAULT_CURRENCIES, ...customCurrencies.filter(c => !c.deletedAt && !DEFAULT_CURRENCIES.some(d => d.code === c.code))], [customCurrencies]);
 
   // --- CRUD 操作 ---
   const handleAction = async (type, id, action) => {
@@ -200,10 +183,10 @@ const App = () => {
 
   const Button = ({ children, onClick, variant = 'primary', className = '', type = "button" }) => {
     const styles = {
-      primary: "bg-[#94A7AE] text-white hover:bg-[#83969D]",
-      secondary: "bg-[#E5E1DA] text-[#6B7280] hover:bg-[#D7D2C8]",
-      outline: "border-2 border-[#94A7AE] text-[#94A7AE] hover:bg-[#F0F4F5]",
-      danger: "bg-[#C0A0A0] text-white hover:bg-[#B08F8F]"
+      primary: "bg-blue-600 text-white hover:bg-blue-700",
+      secondary: "bg-slate-100 text-slate-700 hover:bg-slate-200",
+      outline: "border-2 border-blue-600 text-blue-700 hover:bg-blue-50",
+      danger: "bg-rose-600 text-white hover:bg-rose-700"
     };
     return <button type={type} onClick={onClick} className={`px-4 py-2 rounded-xl transition-all active:scale-95 flex items-center justify-center gap-2 font-medium shadow-sm ${styles[variant]} ${className}`}>{children}</button>;
   };
@@ -211,40 +194,47 @@ const App = () => {
   const renderHome = () => (
     <div className="space-y-6 animate-in fade-in duration-500">
       <header className="flex justify-between items-center">
-        <h1 className="text-3xl font-serif text-[#5B6D72]">日常分帳</h1>
+        <div><p className="text-xs font-bold text-blue-600 tracking-widest">AA APP</p><h1 className="text-3xl font-bold text-slate-900">日常分帳</h1></div>
         <div className="flex gap-2">
           <Button variant="secondary" onClick={() => setCurrentPage(PAGES.TRASH)}><Trash2 size={18}/></Button>
-          <Button onClick={() => { setModalType('project'); setEditingItem(null); setIsModalOpen(true); }}><Plus size={18}/> 新專案</Button>
+          <Button variant="secondary" onClick={() => setCurrentPage(PAGES.SETTINGS)}><Settings size={19}/></Button>
+          <Button onClick={() => { setModalType('project'); setEditingItem(null); setIsModalOpen(true); }}><Plus size={18}/> 新群組</Button>
         </div>
       </header>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {projects.filter(p => !p.deletedAt).map(p => (
+      <div className="space-y-4">
+        {projects.filter(p => !p.deletedAt).map(p => {
+          const summary = calculateDebts(expenses, p.id);
+          const members = globalUsers.filter(u => p.userIds?.includes(u.id) && !u.deletedAt);
+          return (
           <div key={p.id} onClick={() => { setCurrentProjectId(p.id); setCurrentPage(PAGES.PROJECT_DETAIL); }}
-               className="bg-white p-6 rounded-3xl border border-[#F0EBE3] group hover:border-[#94A7AE] transition-all cursor-pointer">
-            <div className="flex justify-between items-start mb-3">
-              <h3 className="text-xl font-medium text-[#6B7280] group-hover:text-[#5B6D72]">{p.name}</h3>
-              <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button onClick={(e) => { e.stopPropagation(); setEditingItem(p); setModalType('project'); setIsModalOpen(true); }} className="text-[#94A7AE]"><Edit2 size={16}/></button>
-                <button onClick={(e) => { e.stopPropagation(); handleAction('project', p.id, 'soft'); }} className="text-[#C0A0A0]"><Trash2 size={16}/></button>
+               className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm group hover:border-blue-400 hover:shadow-md transition-all cursor-pointer">
+            <div className="flex justify-between items-start gap-4">
+              <div><h3 className="text-xl font-bold text-slate-900">{p.name}</h3><p className="text-xs text-slate-500 mt-1">{members.length} 位成員 · {expenses.filter(e => e.projectId === p.id && !e.deletedAt).length} 筆明細</p></div>
+              <div className="flex gap-1 items-center">
+                <button onClick={(e) => { e.stopPropagation(); setEditingItem(p); setModalType('project'); setIsModalOpen(true); }} className="p-2 text-slate-400 hover:text-blue-600"><Edit2 size={16}/></button>
+                <button onClick={(e) => { e.stopPropagation(); handleAction('project', p.id, 'soft'); }} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={16}/></button>
+                <ChevronRight className="text-slate-300 group-hover:text-blue-600" size={20}/>
               </div>
             </div>
-            <p className="text-xs text-[#A3A3A3] flex items-center gap-1"><UserPlus size={14}/> {p.userIds?.length || 0} 位成員</p>
+            <div className="flex flex-wrap gap-2 mt-4">{members.map(u => <span key={u.id} className="px-2.5 py-1 rounded-full bg-blue-50 text-blue-700 text-xs font-medium">{u.name}</span>)}</div>
+            <div className="mt-4 pt-4 border-t border-slate-100 grid sm:grid-cols-2 gap-2">
+              {summary.balances.length ? summary.balances.map(b => <div key={b.uid} className="flex justify-between text-sm bg-slate-50 rounded-lg px-3 py-2"><span>{globalUsers.find(u=>u.id===b.uid)?.name}</span><b className={b.net>.5?'text-emerald-600':b.net<-.5?'text-rose-600':'text-slate-400'}>{b.net>.5?`應收 $${Math.round(b.net)}`:b.net<-.5?`應付 $${Math.round(-b.net)}`:'已打平'}</b></div>) : <p className="text-sm text-slate-400 sm:col-span-2">尚無待結算帳務</p>}
+            </div>
+            {summary.detailed.length > 0 && <p className="mt-3 text-xs text-slate-500">建議轉帳：{summary.detailed.map(d => `${globalUsers.find(u=>u.id===d.from)?.name} → ${globalUsers.find(u=>u.id===d.to)?.name} $${d.amount}`).join('、')}</p>}
           </div>
-        ))}
+        )})}
       </div>
-      <Button variant="outline" className="w-full py-6 border-dashed border-2 rounded-3xl" onClick={() => setCurrentPage(PAGES.USER_EDIT)}>
-        <UserPlus size={20} /> 管理常用成員
-      </Button>
     </div>
   );
 
-  const renderUserEdit = () => (
+  const renderSettings = () => (
     <div className="space-y-6">
       <header className="flex items-center gap-4">
         <Button variant="secondary" onClick={() => setCurrentPage(PAGES.HOME)} className="p-2 rounded-full"><ArrowLeft size={20}/></Button>
-        <h1 className="text-2xl font-serif text-[#5B6D72]">成員編輯</h1>
+        <h1 className="text-2xl font-bold text-slate-900">設定</h1>
       </header>
-      <div className="bg-white rounded-3xl p-6 shadow-sm border border-[#F0EBE3] space-y-4">
+      <section className="bg-white rounded-2xl p-6 shadow-sm border border-slate-200 space-y-4">
+        <div className="flex items-center gap-3"><Users className="text-blue-600"/><div><h2 className="font-bold text-slate-900">常用成員</h2><p className="text-xs text-slate-500">建立群組時可直接加入</p></div></div>
         <div className="flex gap-2">
           <input id="userNameInput" placeholder="輸入成員姓名..." className="flex-1 bg-gray-50 border-none rounded-xl px-4 py-2 outline-none focus:ring-2 focus:ring-[#94A7AE]" />
           <Button onClick={async () => {
@@ -257,12 +247,26 @@ const App = () => {
         <div className="divide-y divide-gray-100">
           {globalUsers.filter(u => !u.deletedAt).map(u => (
             <div key={u.id} className="py-3 flex justify-between items-center group">
-              <span className="text-[#6B7280]">{u.name}</span>
-              <button onClick={() => handleAction('user', u.id, 'soft')} className="text-[#C0A0A0] opacity-0 group-hover:opacity-100 transition-opacity"><Trash2 size={18}/></button>
+              <span className="text-slate-700">{u.name}</span>
+              <button onClick={() => handleAction('user', u.id, 'soft')} className="text-slate-400 hover:text-rose-600"><Trash2 size={18}/></button>
             </div>
           ))}
         </div>
-      </div>
+      </section>
+      <section className="bg-white rounded-2xl p-6 shadow-sm border border-slate-200 space-y-4">
+        <div className="flex items-center gap-3"><Coins className="text-amber-600"/><div><h2 className="font-bold text-slate-900">外幣類別</h2><p className="text-xs text-slate-500">新增 ISO 幣別代碼供記帳選用</p></div></div>
+        <form className="grid grid-cols-2 sm:grid-cols-[1fr_1fr_64px_auto] gap-2" onSubmit={async e => {
+          e.preventDefault(); const fd = new FormData(e.currentTarget); const code = String(fd.get('code')).toUpperCase().trim();
+          if (!code || currencies.some(c => c.code === code)) return;
+          await addDoc(collection(db, 'artifacts', APP_ID, 'public', 'data', 'currencies'), { code, name:fd.get('currencyName'), symbol:fd.get('symbol') || code, deletedAt:null }); e.currentTarget.reset();
+        }}>
+          <input required name="currencyName" placeholder="名稱，如：泰銖" className="min-w-0 bg-slate-50 border rounded-xl px-3 py-2"/>
+          <input required name="code" maxLength="3" placeholder="代碼 THB" className="min-w-0 bg-slate-50 border rounded-xl px-3 py-2 uppercase"/>
+          <input name="symbol" placeholder="฿" className="min-w-0 bg-slate-50 border rounded-xl px-3 py-2"/>
+          <Button type="submit">新增</Button>
+        </form>
+        <div className="flex flex-wrap gap-2">{currencies.map(c => <span key={c.id} className="flex items-center gap-2 px-3 py-2 bg-slate-50 border rounded-xl text-sm"><b>{c.code}</b><span className="text-slate-500">{c.name}</span>{!c.builtIn && <button onClick={() => updateDoc(doc(db,'artifacts',APP_ID,'public','data','currencies',c.id),{deletedAt:Date.now()})}><X size={14}/></button>}</span>)}</div>
+      </section>
     </div>
   );
 
@@ -275,18 +279,18 @@ const App = () => {
         <header className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <Button variant="secondary" onClick={() => setCurrentPage(PAGES.HOME)} className="p-2 rounded-full"><ArrowLeft size={20}/></Button>
-            <h1 className="text-2xl font-serif text-[#5B6D72]">{project.name}</h1>
+            <h1 className="text-2xl font-bold text-slate-900">{project.name}</h1>
           </div>
           <Button onClick={() => { setModalType('expense'); setEditingItem(null); setIsModalOpen(true); }}><Plus size={18}/> 記一筆</Button>
         </header>
-        <div className="bg-[#F0F4F5] rounded-3xl p-6 border border-[#DCE4E6] space-y-4 shadow-inner">
-          <h3 className="text-[10px] font-bold text-[#83969D] tracking-widest uppercase">債務分析</h3>
+        <div className="bg-blue-50 rounded-2xl p-6 border border-blue-100 space-y-4">
+          <h3 className="text-xs font-bold text-blue-700 tracking-widest uppercase">債務分析</h3>
           
           {/* 顯示個人淨額與實際支出明細 */}
           {projectDebts.balances?.length > 0 && (
             <div className="flex flex-col gap-2 mb-4 border-b border-[#DCE4E6] pb-4">
               {projectDebts.balances.map(b => (
-                <div key={b.uid} className={`px-4 py-2.5 rounded-xl text-sm flex justify-between items-center shadow-sm ${Math.abs(b.net) < 0.5 ? 'bg-white text-[#A3A3A3] border border-[#DCE4E6]' : b.net > 0 ? 'bg-white text-[#94A7AE] border border-[#94A7AE]/30' : 'bg-white text-[#C0A0A0] border border-[#C0A0A0]/30'}`}>
+                <div key={b.uid} className={`px-4 py-2.5 rounded-xl text-sm flex justify-between items-center shadow-sm bg-white border ${Math.abs(b.net) < 0.5 ? 'text-slate-400 border-slate-200' : b.net > 0 ? 'text-emerald-700 border-emerald-200' : 'text-rose-700 border-rose-200'}`}>
                   <div>
                     <span className="font-bold block">{globalUsers.find(u => u.id === b.uid)?.name}</span>
                     <span className="text-[10px] opacity-70">
@@ -327,7 +331,7 @@ const App = () => {
                         <span>{globalUsers.find(u => u.id === exp.payerId)?.name} 付</span>
                       </p>
                     </div>
-                    <span className="text-xl font-serif font-bold text-[#5B6D72]">${exp.amount}</span>
+                    <div className="text-right"><span className="text-xl font-bold text-slate-900">NT$ {Number(exp.amount).toLocaleString()}</span>{exp.isForeign && <p className="text-[10px] text-amber-700 mt-1">{exp.currencySymbol} {Number(exp.foreignAmount).toLocaleString()} {exp.currencyCode} · 匯率 {exp.exchangeRate}</p>}</div>
                   </div>
                 </div>
                 {!exp.settled && <button onClick={() => handleAction('expense', exp.id, 'soft')} className="text-[#C0A0A0] hover:scale-110 transition-transform"><Trash2 size={16}/></button>}
@@ -371,9 +375,23 @@ const App = () => {
   const Modal = () => {
     if (!isModalOpen) return null;
     const project = projects.find(p => p.id === currentProjectId);
+    const [isForeign, setIsForeign] = useState(Boolean(editingItem?.isForeign));
+    const [currencyCode, setCurrencyCode] = useState(editingItem?.currencyCode || currencies[0]?.code || 'USD');
+    const [exchangeRate, setExchangeRate] = useState(editingItem?.exchangeRate || '');
+    const [rateStatus, setRateStatus] = useState('');
+    const fetchRate = async () => {
+      setRateStatus('loading');
+      try {
+        const response = await fetch(`https://api.frankfurter.app/latest?from=${currencyCode}&to=TWD`);
+        if (!response.ok) throw new Error('rate request failed');
+        const result = await response.json();
+        if (!result.rates?.TWD) throw new Error('rate unavailable');
+        setExchangeRate(result.rates.TWD); setRateStatus('success');
+      } catch { setRateStatus('error'); }
+    };
     return (
       <div className="fixed inset-0 bg-[#5B6D72]/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-        <div className="bg-[#FAF9F6] w-full max-w-md rounded-[2.5rem] shadow-2xl p-8 animate-in zoom-in-95 border border-[#E5E1DA]">
+        <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl p-8 animate-in zoom-in-95 border border-slate-200 max-h-[92vh] overflow-y-auto">
           <form onSubmit={async (e) => {
             e.preventDefault();
             const fd = new FormData(e.target);
@@ -385,10 +403,18 @@ const App = () => {
                 editingItem ? await updateDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'projects', editingItem.id), p) : await addDoc(collection(db, 'artifacts', APP_ID, 'public', 'data', 'projects'), p);
               } else {
                 const dIds = globalUsers.filter(u => !u.deletedAt && fd.get(`d_${u.id}`)).map(u => u.id);
+                const foreignAmount = Number(data.amount) || 0;
+                const selectedCurrency = currencies.find(c => c.code === data.currencyCode);
+                const convertedAmount = isForeign ? Math.round(foreignAmount * (Number(data.exchangeRate) || 0) * 100) / 100 : foreignAmount;
                 const p = { 
                   projectId: currentProjectId, 
                   name: data.name || "", 
-                  amount: Number(data.amount) || 0, 
+                  amount: convertedAmount,
+                  isForeign,
+                  foreignAmount: isForeign ? foreignAmount : null,
+                  currencyCode: isForeign ? data.currencyCode : null,
+                  currencySymbol: isForeign ? (selectedCurrency?.symbol || data.currencyCode) : null,
+                  exchangeRate: isForeign ? Number(data.exchangeRate) : null,
                   date: data.date || "", 
                   payerId: data.payerId || "", 
                   debtorIds: dIds, 
@@ -416,8 +442,24 @@ const App = () => {
               ) : (
                 <>
                   <div className="flex gap-3">
-                    <input required name="amount" type="number" defaultValue={editingItem?.amount} placeholder="金額" className="w-1/2 bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none" />
+                    <input required name="amount" type="number" min="0" step="any" defaultValue={editingItem?.isForeign ? editingItem.foreignAmount : editingItem?.amount} placeholder="金額" className="w-1/2 bg-white border border-slate-200 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500" />
                     <input required name="date" type="date" defaultValue={editingItem?.date || new Date().toISOString().split('T')[0]} className="w-1/2 bg-white border border-[#E5E1DA] rounded-xl px-4 py-3 outline-none" />
+                  </div>
+                  <div className="rounded-xl border border-slate-200 overflow-hidden">
+                    <label className="flex items-center justify-between p-4 cursor-pointer bg-white">
+                      <span><b className="block text-sm text-slate-800">使用外幣</b><span className="text-xs text-slate-500">換算為新台幣後加入分帳</span></span>
+                      <input type="checkbox" checked={isForeign} onChange={e => setIsForeign(e.target.checked)} className="w-5 h-5 accent-blue-600"/>
+                    </label>
+                    {isForeign && <div className="p-4 bg-amber-50 border-t border-amber-100 space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <select name="currencyCode" value={currencyCode} onChange={e=>{setCurrencyCode(e.target.value);setRateStatus('')}} className="bg-white border border-amber-200 rounded-xl px-3 py-2">
+                          {currencies.map(c => <option key={c.id} value={c.code}>{c.code} · {c.name}</option>)}
+                        </select>
+                        <input required name="exchangeRate" type="number" min="0" step="any" value={exchangeRate} onChange={e=>setExchangeRate(e.target.value)} placeholder="1 外幣 = ? TWD" className="bg-white border border-amber-200 rounded-xl px-3 py-2"/>
+                      </div>
+                      <button type="button" onClick={fetchRate} disabled={rateStatus==='loading'} className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium flex justify-center items-center gap-2"><RefreshCw size={15} className={rateStatus==='loading'?'animate-spin':''}/>{rateStatus==='loading'?'查詢中…':'取得今日匯率'}</button>
+                      <p className={`text-xs ${rateStatus==='error'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success'?'已取得今日參考匯率，可再手動調整。':rateStatus==='error'?'此幣別暫無線上匯率，請手動輸入。':'匯率定義：1 單位外幣可兌換多少新台幣。'}</p>
+                    </div>}
                   </div>
                   <select name="payerId" defaultValue={editingItem?.payerId} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3">
                     {globalUsers.filter(u => !u.deletedAt && project?.userIds?.includes(u.id)).map(u => <option key={u.id} value={u.id}>{u.name} 付款</option>)}
@@ -446,7 +488,7 @@ const App = () => {
   };
 
   return (
-    <div className="min-h-screen bg-[#F7F4EF] text-[#444] pb-20 font-sans selection:bg-[#94A7AE]/20">
+    <div className="min-h-screen bg-slate-50 text-slate-700 pb-20 font-sans selection:bg-blue-200">
       {!user ? (
         <div className="flex h-screen items-center justify-center">
           <div className="w-10 h-10 border-4 border-[#94A7AE] border-t-transparent rounded-full animate-spin"></div>
@@ -454,15 +496,15 @@ const App = () => {
       ) : (
         <div className="max-w-xl mx-auto px-6 py-10">
           {currentPage === PAGES.HOME && renderHome()}
-          {currentPage === PAGES.USER_EDIT && renderUserEdit()}
+          {currentPage === PAGES.SETTINGS && renderSettings()}
           {currentPage === PAGES.TRASH && renderTrash()}
           {currentPage === PAGES.PROJECT_DETAIL && renderProjectDetail()}
         </div>
       )}
-      <Modal />
+      {isModalOpen && <Modal />}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700&family=Noto+Sans+TC:wght@400;500&display=swap');
-        body { font-family: 'Noto Sans TC', sans-serif; background-color: #F7F4EF; }
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f8fafc; }
         .font-serif { font-family: 'Noto Serif TC', serif; }
       `}</style>
     </div>
