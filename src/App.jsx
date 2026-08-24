@@ -53,6 +53,7 @@ if (isValidConfig) {
 
 const APP_ID = 'AAApp'; 
 const EXCHANGE_RATE_API_URL = import.meta.env.VITE_EXCHANGE_RATE_API_URL || '/api/exchange-rates';
+const EXCHANGE_RATE_CDN_URL = 'https://cdn.jsdelivr.net/gh/haotool/app@data/public/rates/latest.json';
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
 const PAGES = { HOME: 'home', SETTINGS: 'settings', PROJECT_DETAIL: 'project_detail', TRASH: 'trash' };
 const DEFAULT_CURRENCIES = [
@@ -383,6 +384,7 @@ const App = () => {
     const [exchangeRate, setExchangeRate] = useState(editingItem?.exchangeRate || '');
     const [rateStatus, setRateStatus] = useState('');
     const [rateInfo, setRateInfo] = useState(null);
+    const [rateError, setRateError] = useState('');
     const currencySelectRef = useRef(null);
     const fetchRate = async () => {
       const selectedCode = String(currencySelectRef.current?.value || '').trim().toUpperCase();
@@ -390,17 +392,30 @@ const App = () => {
       setCurrencyCode(selectedCode);
       setRateStatus('loading');
       setRateInfo(null);
+      setRateError('');
       try {
         const separator = EXCHANGE_RATE_API_URL.includes('?') ? '&' : '?';
-        const response = await fetch(`${EXCHANGE_RATE_API_URL}${separator}currency=${encodeURIComponent(selectedCode)}`);
-        if (!response.ok) throw new Error('rate request failed');
-        const result = await response.json();
+        let result;
+        try {
+          const response = await fetch(`${EXCHANGE_RATE_API_URL}${separator}currency=${encodeURIComponent(selectedCode)}`);
+          result = await response.json();
+          if (!response.ok) throw new Error(result.error || `匯率 API 回應 ${response.status}`);
+        } catch {
+          const response = await fetch(EXCHANGE_RATE_CDN_URL);
+          if (!response.ok) throw new Error(`備援匯率服務回應 ${response.status}`);
+          const snapshot = await response.json();
+          const rate = Number(snapshot.details?.[selectedCode]?.spot?.sell);
+          result = { source:'臺灣銀行（CDN 快照）', rateDate:String(snapshot.updateTime || '').slice(0,10), quote: Number.isFinite(rate) && rate > 0 ? {rate,type:'即期賣出'} : null };
+        }
         const quote = result.quote;
         if (!quote?.rate) throw new Error('rate unavailable');
         setExchangeRate(quote.rate);
         setRateInfo({ ...quote, rateDate: result.rateDate, source: result.source });
         setRateStatus('success');
-      } catch { setRateStatus('error'); }
+      } catch (error) {
+        setRateError(error instanceof Error ? error.message : '無法連線至匯率 API');
+        setRateStatus('error');
+      }
     };
     return (
       <div className="fixed inset-0 bg-[#5B6D72]/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -471,7 +486,7 @@ const App = () => {
                         <input required name="exchangeRate" type="number" min="0" step="any" value={exchangeRate} onChange={e=>setExchangeRate(e.target.value)} placeholder="1 外幣 = ? TWD" className="bg-white border border-amber-200 rounded-xl px-3 py-2"/>
                       </div>
                       <button type="button" onClick={fetchRate} disabled={rateStatus==='loading'} className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium flex justify-center items-center gap-2"><RefreshCw size={15} className={rateStatus==='loading'?'animate-spin':''}/>{rateStatus==='loading'?'查詢中…':'取得今日匯率'}</button>
-                      <p className={`text-xs ${rateStatus==='error'||rateStatus==='invalid'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success' ? `${rateInfo?.source} ${rateInfo?.rateDate} ${rateInfo?.type}價，可再手動調整。` : rateStatus==='invalid' ? '幣別代碼必須是三個英文字母。' : rateStatus==='error'?'臺灣銀行未提供此幣別的即期匯率，或官方服務暫時無法連線，請手動輸入。':'資料來源：臺灣銀行前一營業日即期賣出收盤價，不使用現金匯率。'}</p>
+                      <p className={`text-xs ${rateStatus==='error'||rateStatus==='invalid'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success' ? `${rateInfo?.source} ${rateInfo?.rateDate} ${rateInfo?.type}價，可再手動調整。` : rateStatus==='invalid' ? '幣別代碼必須是三個英文字母。' : rateStatus==='error' ? rateError : '資料來源：臺灣銀行最新即期賣出價，不使用現金匯率。'}</p>
                     </div>}
                   </div>
                   <select name="payerId" defaultValue={editingItem?.payerId} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3">
