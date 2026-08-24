@@ -5,11 +5,14 @@ import { getBankOfTaiwanRates } from './server/bankOfTaiwanRates.js'
 const bankOfTaiwanApi = () => ({
   name: 'bank-of-taiwan-exchange-rate-api',
   configureServer(server) {
-    server.middlewares.use('/api/exchange-rates', async (_request, response) => {
+    server.middlewares.use('/api/exchange-rates', async (request, response) => {
       response.setHeader('Content-Type', 'application/json; charset=utf-8')
       try {
-        response.statusCode = 200
-        response.end(JSON.stringify(await getBankOfTaiwanRates()))
+        const data = await getBankOfTaiwanRates()
+        const currency = new URL(request.url || '/', 'http://localhost').searchParams.get('currency')?.trim().toUpperCase()
+        const quote = currency ? data.rates[currency] : null
+        response.statusCode = currency && !quote ? 404 : 200
+        response.end(JSON.stringify(currency ? (quote ? { ...data, currency, quote, rates: undefined } : { error: `查無 ${currency} 的即期匯率` }) : data))
       } catch (error) {
         response.statusCode = 502
         response.end(JSON.stringify({ error: error.message || '無法取得臺灣銀行匯率' }))

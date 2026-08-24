@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
   getFirestore, collection, doc, addDoc, updateDoc, 
@@ -127,6 +127,7 @@ const App = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalType, setModalType] = useState('');
   const [editingItem, setEditingItem] = useState(null);
+  const [editingCurrency, setEditingCurrency] = useState(null);
 
   /**
    * 2. Firebase 認證與監聽
@@ -171,7 +172,8 @@ const App = () => {
 
   // --- 分帳演算邏輯 ---
   const projectDebts = useMemo(() => calculateDebts(expenses, currentProjectId), [expenses, currentProjectId]);
-  const currencies = useMemo(() => [...DEFAULT_CURRENCIES, ...customCurrencies.filter(c => !c.deletedAt && !DEFAULT_CURRENCIES.some(d => d.code === c.code))], [customCurrencies]);
+  const currencies = useMemo(() => [...DEFAULT_CURRENCIES, ...customCurrencies.filter(c => !c.deletedAt && !DEFAULT_CURRENCIES.some(d => d.code === String(c.code || '').trim().toUpperCase()))]
+    .map(c => ({ ...c, code: String(c.code || '').trim().toUpperCase() })), [customCurrencies]);
 
   // --- CRUD 操作 ---
   const handleAction = async (type, id, action) => {
@@ -266,7 +268,7 @@ const App = () => {
           <input name="symbol" placeholder="฿" className="min-w-0 bg-slate-50 border rounded-xl px-3 py-2"/>
           <Button type="submit">新增</Button>
         </form>
-        <div className="flex flex-wrap gap-2">{currencies.map(c => <span key={c.id} className="flex items-center gap-2 px-3 py-2 bg-slate-50 border rounded-xl text-sm"><b>{c.code}</b><span className="text-slate-500">{c.name}</span>{!c.builtIn && <button onClick={() => updateDoc(doc(db,'artifacts',APP_ID,'public','data','currencies',c.id),{deletedAt:Date.now()})}><X size={14}/></button>}</span>)}</div>
+        <div className="flex flex-wrap gap-2">{currencies.map(c => <div key={c.id} className="flex items-center bg-slate-50 border rounded-xl text-sm overflow-hidden"><button type="button" disabled={c.builtIn} onClick={() => setEditingCurrency(c)} className={`flex items-center gap-2 px-3 py-2 ${c.builtIn ? 'cursor-default' : 'hover:bg-blue-50 hover:text-blue-700'}`} title={c.builtIn ? '系統內建幣別' : '點擊編輯'}><b>{c.code}</b><span className="text-slate-500">{c.name}</span>{!c.builtIn && <Edit2 size={13}/>}</button>{!c.builtIn && <button aria-label={`刪除 ${c.code}`} onClick={() => updateDoc(doc(db,'artifacts',APP_ID,'public','data','currencies',c.id),{deletedAt:Date.now()})} className="p-2 border-l text-slate-400 hover:text-rose-600"><X size={14}/></button>}</div>)}</div>
       </section>
     </div>
   );
@@ -381,14 +383,19 @@ const App = () => {
     const [exchangeRate, setExchangeRate] = useState(editingItem?.exchangeRate || '');
     const [rateStatus, setRateStatus] = useState('');
     const [rateInfo, setRateInfo] = useState(null);
+    const currencySelectRef = useRef(null);
     const fetchRate = async () => {
+      const selectedCode = String(currencySelectRef.current?.value || '').trim().toUpperCase();
+      if (!/^[A-Z]{3}$/.test(selectedCode)) { setRateStatus('invalid'); return; }
+      setCurrencyCode(selectedCode);
       setRateStatus('loading');
       setRateInfo(null);
       try {
-        const response = await fetch(EXCHANGE_RATE_API_URL);
+        const separator = EXCHANGE_RATE_API_URL.includes('?') ? '&' : '?';
+        const response = await fetch(`${EXCHANGE_RATE_API_URL}${separator}currency=${encodeURIComponent(selectedCode)}`);
         if (!response.ok) throw new Error('rate request failed');
         const result = await response.json();
-        const quote = result.rates?.[currencyCode];
+        const quote = result.quote;
         if (!quote?.rate) throw new Error('rate unavailable');
         setExchangeRate(quote.rate);
         setRateInfo({ ...quote, rateDate: result.rateDate, source: result.source });
@@ -458,13 +465,13 @@ const App = () => {
                     </label>
                     {isForeign && <div className="p-4 bg-amber-50 border-t border-amber-100 space-y-3">
                       <div className="grid grid-cols-2 gap-2">
-                        <select name="currencyCode" value={currencyCode} onChange={e=>{setCurrencyCode(e.target.value);setRateStatus('');setRateInfo(null)}} className="bg-white border border-amber-200 rounded-xl px-3 py-2">
+                        <select ref={currencySelectRef} name="currencyCode" value={currencyCode} onChange={e=>{setCurrencyCode(e.target.value.trim().toUpperCase());setRateStatus('');setRateInfo(null)}} className="bg-white border border-amber-200 rounded-xl px-3 py-2">
                           {currencies.map(c => <option key={c.id} value={c.code}>{c.code} · {c.name}</option>)}
                         </select>
                         <input required name="exchangeRate" type="number" min="0" step="any" value={exchangeRate} onChange={e=>setExchangeRate(e.target.value)} placeholder="1 外幣 = ? TWD" className="bg-white border border-amber-200 rounded-xl px-3 py-2"/>
                       </div>
                       <button type="button" onClick={fetchRate} disabled={rateStatus==='loading'} className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium flex justify-center items-center gap-2"><RefreshCw size={15} className={rateStatus==='loading'?'animate-spin':''}/>{rateStatus==='loading'?'查詢中…':'取得今日匯率'}</button>
-                      <p className={`text-xs ${rateStatus==='error'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success' ? `${rateInfo?.source} ${rateInfo?.rateDate} ${rateInfo?.type}價，可再手動調整。` : rateStatus==='error'?'臺灣銀行未提供此幣別的即期匯率，或官方服務暫時無法連線，請手動輸入。':'資料來源：臺灣銀行前一營業日即期賣出收盤價，不使用現金匯率。'}</p>
+                      <p className={`text-xs ${rateStatus==='error'||rateStatus==='invalid'?'text-rose-600':'text-amber-800'}`}>{rateStatus==='success' ? `${rateInfo?.source} ${rateInfo?.rateDate} ${rateInfo?.type}價，可再手動調整。` : rateStatus==='invalid' ? '幣別代碼必須是三個英文字母。' : rateStatus==='error'?'臺灣銀行未提供此幣別的即期匯率，或官方服務暫時無法連線，請手動輸入。':'資料來源：臺灣銀行前一營業日即期賣出收盤價，不使用現金匯率。'}</p>
                     </div>}
                   </div>
                   <select name="payerId" defaultValue={editingItem?.payerId} className="w-full bg-white border border-[#E5E1DA] rounded-xl px-4 py-3">
@@ -493,6 +500,31 @@ const App = () => {
     );
   };
 
+  const CurrencyEditModal = () => {
+    if (!editingCurrency) return null;
+    return (
+      <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[60] flex items-center justify-center p-4" onMouseDown={e => e.target === e.currentTarget && setEditingCurrency(null)}>
+        <form className="bg-white w-full max-w-sm rounded-3xl shadow-2xl p-7 space-y-5" onSubmit={async e => {
+          e.preventDefault();
+          const fd = new FormData(e.currentTarget);
+          const code = String(fd.get('code') || '').trim().toUpperCase();
+          const duplicate = currencies.some(c => c.id !== editingCurrency.id && c.code === code);
+          if (!/^[A-Z]{3}$/.test(code) || duplicate) return;
+          await updateDoc(doc(db, 'artifacts', APP_ID, 'public', 'data', 'currencies', editingCurrency.id), {
+            name: String(fd.get('currencyName') || '').trim(), code, symbol: String(fd.get('symbol') || '').trim() || code
+          });
+          setEditingCurrency(null);
+        }}>
+          <div className="flex justify-between items-start"><div><p className="text-xs font-bold text-blue-600 tracking-widest">CURRENCY</p><h2 className="text-xl font-bold text-slate-900">編輯外幣類別</h2></div><button type="button" onClick={() => setEditingCurrency(null)} className="p-2 text-slate-400 hover:text-slate-700"><X size={20}/></button></div>
+          <label className="block text-sm font-medium text-slate-700">幣別名稱<input required name="currencyName" defaultValue={editingCurrency.name} className="mt-1.5 w-full border border-slate-200 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"/></label>
+          <label className="block text-sm font-medium text-slate-700">ISO 幣別代碼<input required name="code" maxLength="3" pattern="[A-Za-z]{3}" defaultValue={editingCurrency.code} className="mt-1.5 w-full border border-slate-200 rounded-xl px-4 py-3 uppercase outline-none focus:ring-2 focus:ring-blue-500"/></label>
+          <label className="block text-sm font-medium text-slate-700">顯示符號<input name="symbol" defaultValue={editingCurrency.symbol} className="mt-1.5 w-full border border-slate-200 rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"/></label>
+          <div className="flex gap-3"><Button variant="secondary" className="flex-1" onClick={() => setEditingCurrency(null)}>取消</Button><Button type="submit" className="flex-1">儲存變更</Button></div>
+        </form>
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-700 pb-20 font-sans selection:bg-blue-200">
       {!user ? (
@@ -508,6 +540,7 @@ const App = () => {
         </div>
       )}
       {isModalOpen && <Modal />}
+      {editingCurrency && <CurrencyEditModal />}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700&family=Noto+Sans+TC:wght@400;500&display=swap');
         body { font-family: 'Noto Sans TC', sans-serif; background-color: #f8fafc; }

@@ -26,12 +26,14 @@ export const getBankOfTaiwanRates = async () => {
   // 從昨天開始往前找，週末與國定假日會自動略過。
   for (let daysAgo = 1; daysAgo <= 10 && !Object.keys(rates).length; daysAgo += 1) {
     cursor.setUTCDate(cursor.getUTCDate() - 1);
+    if (cursor.getUTCDay() === 0 || cursor.getUTCDay() === 6) continue;
     const candidateDate = cursor.toISOString().slice(0, 10);
     const response = await fetch(`${BOT_CSV_URL}/${candidateDate}`, {
       headers: {
         accept: 'text/csv,text/plain;q=0.9,*/*;q=0.8',
         'user-agent': 'AAApp/1.0 (Bank of Taiwan public exchange-rate client)'
       },
+      signal: AbortSignal.timeout(25000),
       redirect: 'follow'
     });
     if (!response.ok || !response.url.includes('rate.bot.com.tw')) continue;
